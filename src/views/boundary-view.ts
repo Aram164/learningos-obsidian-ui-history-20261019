@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { ItemView, type WorkspaceLeaf } from 'obsidian';
 import { badge, button, disclosure, empty, pageHeader, section } from '../components';
 import { VIEW_BOUNDARY } from '../constants';
@@ -103,7 +104,8 @@ export class BoundaryView extends ItemView {
   }
 
   render() {
-    const root = this.contentEl; root.empty(); root.addClass('los-root', 'los-boundary-view');
+    const root = this.contentEl; root.empty();
+    manifestFreshness(root, this.plugin.store); root.addClass('los-root', 'los-boundary-view');
     if (this.boundaryId === 'program-masters-planning') {
       this.renderMastersPlanning(root);
       return;

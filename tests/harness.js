@@ -339,6 +339,7 @@ function makeApp(vaultRoot) {
 
   const leaves = [];
   const workspaceListeners = new Map();
+  const vaultListeners = new Map();
   const app = {
     internalPlugins: {
       enabled: new Set(),
@@ -354,7 +355,14 @@ function makeApp(vaultRoot) {
       getAbstractFileByPath: (p) => byPath.get(p) || folders.get(p) || null,
       cachedRead: async (f) => fs.readFileSync(path.join(vaultRoot, f.path), 'utf8'),
       create: async (p) => { throw new Error(`test vault is read-only: ${p}`); },
-      on: () => ({ off() {} }),
+      on(name, callback) {
+        if (!vaultListeners.has(name)) vaultListeners.set(name, new Set());
+        const listeners = vaultListeners.get(name); listeners.add(callback);
+        return { off() { listeners.delete(callback); } };
+      },
+      trigger(name, ...args) {
+        for (const callback of [...(vaultListeners.get(name) || [])]) callback(...args);
+      },
     },
     metadataCache: {
       getFileCache: (f) => ({

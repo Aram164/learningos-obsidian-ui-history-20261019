@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { withRenderFocus } from '../accessibility/render-focus';
 import { ItemView, type WorkspaceLeaf } from 'obsidian';
 import * as fs from 'node:fs';
@@ -146,6 +147,7 @@ export class ReviewView extends ItemView implements ReviewHost {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-review-view',
@@ -656,6 +658,7 @@ export class DiagnosticsView extends ItemView {
   private renderContent(): void {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass('los-root', 'los-diagnostics-view');
     pageHeader(root, 'More', 'Diagnostics');
     const tabs = root.createDiv({ cls: 'los-subtabs', attr: { 'aria-label': 'Diagnostics sections' } });

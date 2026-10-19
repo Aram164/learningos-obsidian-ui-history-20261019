@@ -196,11 +196,11 @@ export interface GatewayRecoveryPort {
   begin(record: GatewayRecoveryRecordV1): Promise<void>;
   /** The stored entry, or null when there is nothing replayable. */
   replayable(): GatewayRecoveryEntry | null;
-  markRecovering(error: GatewayRecoveryErrorV1 | null): Promise<void>;
-  markConfirmed(confirmation: GatewaySuccessV2): Promise<void>;
-  markBlocked(error: GatewayRecoveryErrorV1): Promise<void>;
+  markRecovering(error: GatewayRecoveryErrorV1 | null, expected?: GatewayRecoveryEntry): Promise<void>;
+  markConfirmed(confirmation: GatewaySuccessV2, expected?: GatewayRecoveryEntry): Promise<void>;
+  markBlocked(error: GatewayRecoveryErrorV1, expected?: GatewayRecoveryEntry): Promise<void>;
   /** Only for a strict, definitive no-commit refusal. Drafts are untouched. */
-  discardRefused(): Promise<void>;
+  discardRefused(expected?: GatewayRecoveryEntry): Promise<void>;
 }
 
 /** The default port: real phases, no persistence, and no fresh-write gate. */
@@ -228,42 +228,55 @@ export class MemoryGatewayRecoveryStore implements GatewayRecoveryPort {
     this.current = entry;
   }
 
-  private required(): GatewayRecoveryEntry {
+  protected required(expected?: GatewayRecoveryEntry): GatewayRecoveryEntry {
     if (!this.current) throw new Error('There is no prepared Gateway request to advance.');
+    if (expected !== undefined && this.current !== expected) {
+      throw new Error('The Gateway recovery request or phase changed; the older result was ignored.');
+    }
     return this.current;
   }
 
   async begin(next: GatewayRecoveryRecordV1): Promise<void> {
+    const previous = this.replayable();
     const validated = await validateGatewayRecoveryRecord(next);
     if (!validated.ok) throw new Error(`Refusing to persist an invalid recovery record: ${validated.error}`);
+    if (this.replayable() !== previous) {
+      throw new Error('The Gateway recovery request changed while preparing this write.');
+    }
     await this.write(validated.entry);
   }
 
-  async markRecovering(error: GatewayRecoveryErrorV1 | null): Promise<void> {
-    const { record: stored, envelope } = this.required();
+  async markRecovering(error: GatewayRecoveryErrorV1 | null, expected?: GatewayRecoveryEntry): Promise<void> {
+    const { record: stored, envelope } = this.required(expected);
     await this.write({
       record: { ...stored, phase: 'recovering', last_error: error },
       envelope,
     });
   }
 
-  async markConfirmed(confirmation: GatewaySuccessV2): Promise<void> {
-    const { record: stored, envelope } = this.required();
+  async markConfirmed(confirmation: GatewaySuccessV2, expected?: GatewayRecoveryEntry): Promise<void> {
+    const { record: stored, envelope } = this.required(expected);
+    asGatewaySuccessV2(confirmation, {
+      requestId: envelope.request_id,
+      idempotencyKey: envelope.idempotency_key,
+      capability: envelope.capability,
+    });
     await this.write({
       record: { ...stored, phase: 'confirmed', confirmation, last_error: null },
       envelope,
     });
   }
 
-  async markBlocked(error: GatewayRecoveryErrorV1): Promise<void> {
-    const { record: stored, envelope } = this.required();
+  async markBlocked(error: GatewayRecoveryErrorV1, expected?: GatewayRecoveryEntry): Promise<void> {
+    const { record: stored, envelope } = this.required(expected);
     await this.write({
       record: { ...stored, phase: 'blocked', last_error: error },
       envelope,
     });
   }
 
-  async discardRefused(): Promise<void> {
+  async discardRefused(expected?: GatewayRecoveryEntry): Promise<void> {
+    if (expected !== undefined) this.required(expected);
     await this.write(null);
   }
 }
@@ -282,6 +295,7 @@ export interface GatewayRecoverySettingsHost {
  */
 export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
   private status: GatewayRecoveryState = { kind: 'clear' };
+  private saveVersion = 0;
 
   constructor(
     private readonly settings: GatewayRecoverySettingsHost,
@@ -311,12 +325,17 @@ export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
    * evidence survives for Diagnostics and no write process is launched.
    */
   async load(): Promise<GatewayRecoveryState> {
+    const version = this.saveVersion;
     const raw = this.settings.gatewayRecovery;
     if (raw === null || raw === undefined) {
+      this.current = null;
+      this.saveVersion += 1;
       this.status = { kind: 'clear' };
       return this.status;
     }
     const validated = await validateGatewayRecoveryRecord(raw);
+    if (version !== this.saveVersion || this.settings.gatewayRecovery !== raw) return this.status;
+    this.saveVersion += 1;
     this.current = validated.ok ? validated.entry : null;
     this.status = validated.ok
       ? { kind: 'record', entry: validated.entry }
@@ -343,16 +362,22 @@ export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
     const previousSlot = this.settings.gatewayRecovery;
     const previousCurrent = this.current;
     const previousStatus = this.status;
+    const version = ++this.saveVersion;
     this.settings.gatewayRecovery = entry ? entry.record : null;
     this.current = entry;
     this.status = entry ? { kind: 'record', entry } : { kind: 'clear' };
     try {
       await this.persist();
     } catch (error: unknown) {
-      this.settings.gatewayRecovery = previousSlot;
-      this.current = previousCurrent;
-      this.status = previousStatus;
+      if (this.saveVersion === version) {
+        this.settings.gatewayRecovery = previousSlot;
+        this.current = previousCurrent;
+        this.status = previousStatus;
+      }
       throw error;
+    }
+    if (this.saveVersion !== version) {
+      throw new Error('The Gateway recovery state changed during the save; the older transition was ignored.');
     }
   }
 
@@ -367,13 +392,18 @@ export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
    * and every draft this settlement cleared, so the learner's text is not
    * silently destroyed by a settlement that never reached disk.
    */
-  async settleConfirmed(): Promise<void> {
+  async settleConfirmed(expected?: GatewayRecoveryEntry): Promise<void> {
     const entry = this.replayable();
-    if (!entry) return;
+    if (!entry && expected === undefined) return;
+    this.required(expected);
+    if (!entry || entry.record.phase !== 'confirmed') {
+      throw new Error('Only a confirmed Gateway request can be settled.');
+    }
     const previousSlot = this.settings.gatewayRecovery;
     const previousCurrent = this.current;
     const previousStatus = this.status;
     const previousDrafts = structuredClone(this.settings.uiDrafts);
+    const version = ++this.saveVersion;
 
     clearDraftsOwnedBy(this.settings.uiDrafts, entry.envelope);
     const postCleanupDrafts = structuredClone(this.settings.uiDrafts);
@@ -384,6 +414,7 @@ export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
     try {
       await this.persist();
     } catch (error: unknown) {
+      if (this.saveVersion !== version) throw error;
       this.settings.gatewayRecovery = previousSlot;
       this.current = previousCurrent;
       this.status = previousStatus;
@@ -415,6 +446,9 @@ export class SettingsGatewayRecoveryStore extends MemoryGatewayRecoveryStore {
       }
 
       throw error;
+    }
+    if (this.saveVersion !== version) {
+      throw new Error('The Gateway recovery state changed during settlement; the older result was ignored.');
     }
   }
 }

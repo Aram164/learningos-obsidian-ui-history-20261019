@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { withRenderFocus } from '../accessibility/render-focus';
 import {
   ItemView,
@@ -114,6 +115,7 @@ export class GardenView extends ItemView {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-garden-view',

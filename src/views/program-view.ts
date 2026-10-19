@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { withRenderFocus } from '../accessibility/render-focus';
 import { ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
 import {
@@ -151,6 +152,7 @@ export class ProgramView extends ItemView {
   private renderContent(): void {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass('los-root', 'los-program-view');
 
     // The Navigator can reach this view whatever the projection's health, so it

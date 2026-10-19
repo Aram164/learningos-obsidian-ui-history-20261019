@@ -130,6 +130,9 @@ declare module 'obsidian' {
   export interface Vault {
     readonly adapter: VaultAdapter;
 
+    on(name: 'create' | 'modify' | 'delete', callback: (file: TAbstractFile) => unknown): EventRef;
+    on(name: 'rename', callback: (file: TAbstractFile, oldPath: string) => unknown): EventRef;
+
     getAbstractFileByPath(
       path: string,
     ): TAbstractFile | null;
@@ -182,6 +185,7 @@ declare module 'obsidian' {
     ): void;
 
     registerEvent(event: EventRef): void;
+    registerDomEvent(target: Window, name: 'focus', callback: (event: FocusEvent) => unknown): void;
 
     addSettingTab(
       tab: PluginSettingTab,

@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../../components';
 import { button, empty, filterTabs, pageHeader } from '../../components';
 import { enableButtonGroupKeyboardNavigation } from '../../accessibility/button-group';
 import type { AtlasLensV1 } from '../../contracts/route-v1';
@@ -396,6 +397,7 @@ export function renderAtlas(root: HTMLElement, host: AtlasHost): void {
   const domainLens = host.state.lens === 'domains';
 
   root.empty();
+    manifestFreshness(root, host.plugin.store);
   root.addClass('los-root', 'los-atlas-view');
   root.toggleClass('los-domain-view', domainLens);
   if (domainLens) {

@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
 import { button, empty, pageHeader, section, unitCard } from '../components';
 import { VIEW_SHELVING } from '../constants';
@@ -198,6 +199,7 @@ export class ShelvingView extends ItemView {
   render(): void {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass('los-root', 'los-shelving-view');
 
     const unit = this.unitId

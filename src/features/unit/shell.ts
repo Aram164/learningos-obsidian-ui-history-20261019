@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../../components';
 import type { UnitShellHost } from './ports';
 import {
   button,
@@ -29,6 +30,7 @@ export function render(
     const root = view.contentEl;
 
     root.empty();
+    manifestFreshness(root, view.plugin.store);
     root.addClass(
       'los-root',
       'los-unit-view',
