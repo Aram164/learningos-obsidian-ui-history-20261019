@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { renderElsewhere, renderHomeRow, nextWorkspaceDate, moduleNextAction } from '../features/home/elsewhere';
 import { renderContinue, renderToday } from '../features/home/focus';
 import {
@@ -72,6 +73,7 @@ export class HomeView extends ItemView {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-home',

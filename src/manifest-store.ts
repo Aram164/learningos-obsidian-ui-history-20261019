@@ -198,15 +198,18 @@ export class ManifestStore {
   private readonly app: ManifestStoreHost;
   private indexes: StoreIndexes;
   ready: boolean;
+  stale: boolean;
   error: string;
   data: Manifest | null;
   records: ProjectionRecord[];
   byId: Map<string, ProjectionRecord>;
   contractVersion: number | null = null;
   snapshotId: string | null = null;
-  constructor(app: ManifestStoreHost) {
+  private loadVersion = 0;
+  constructor(app: ManifestStoreHost, private readonly canPublish: () => boolean = () => true) {
     this.app = app;
     this.ready = false;
+    this.stale = false;
     this.error = '';
     this.data = null;
     // Initialised here, not only inside load()'s success branch: a failed load
@@ -217,6 +220,7 @@ export class ManifestStore {
   }
 
   async load() {
+    const request = ++this.loadVersion;
     try {
       if (!(await this.app.vault.adapter.exists('generated/manifest.json'))) {
         throw new Error('Projection unavailable — rebuild it to continue.');
@@ -272,6 +276,7 @@ export class ManifestStore {
       // Publish one complete store snapshot only after every contract and
       // indexing step succeeds. A reader can therefore never observe half of
       // the new manifest mixed with half of the old one.
+      if (request !== this.loadVersion || !this.canPublish()) return false;
       this.data = manifest;
       this.contractVersion = version;
       this.snapshotId = manifest._generated.snapshot_id;
@@ -279,11 +284,23 @@ export class ManifestStore {
       this.byId = byId;
       this.indexes = indexes;
       this.ready = true;
+      this.stale = false;
       this.error = '';
       return true;
     } catch (error: unknown) {
-      this.ready = false;
+      if (request !== this.loadVersion || !this.canPublish()) return false;
       this.error = error instanceof Error ? error.message : String(error);
+      if (this.data !== null) {
+        // Retain the last valid snapshot and every matching index. The
+        // explicit stale state lets reads continue while guaranteeing
+        // nobody mistakes this snapshot for a fresh one: write paths
+        // refuse a stale snapshot id (GatewayClient.snapshotId).
+        this.stale = true;
+        this.ready = true;
+        return false;
+      }
+      this.ready = false;
+      this.stale = false;
       this.data = null;
       this.records = [];
       this.byId = new Map();

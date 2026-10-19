@@ -220,15 +220,60 @@ function fixtureManifest() {
     'callers receive a fresh result array, not the cached index array',
   );
 
+  // A failed refresh retains the last valid snapshot and all matching
+  // indexes, explicitly stale — reads continue, nothing partial renders.
   manifest = { ...fixtureManifest(), indexes: {} };
   assert.equal(await store.load(), false);
-  assert.equal(store.data, null);
-  assert.deepEqual(store.modules(), []);
-  assert.deepEqual(store.search('linear'), []);
-  assert.equal(store.sourceMap('module-active'), null);
-  assert.equal(store.materialSynthesisForUnit('unit-active'), null);
-  assert.deepEqual(store.unitNoteSections('unit-active'), []);
-  assert.deepEqual(store.relations(), []);
+  assert.equal(store.stale, true);
+  assert.equal(store.snapshotId, 'snapshot-test');
+  assert.deepEqual(store.modules().map((row) => row.id), ['module-active']);
+  assert.deepEqual(store.search('linear').map((row) => row.id), ['source-linear-algebra']);
+  assert.equal(store.sourceMap('module-active')?.id, 'source-map-active');
+  assert.equal(store.materialSynthesisForUnit('unit-active')?.id, 'material-synthesis-active');
+  assert.equal(store.unitNoteSections('unit-active')[0]?.text, 'Exact note');
+  assert.equal(store.relations().length, 2);
+
+  // A successful refresh clears the stale state with the new snapshot.
+  manifest = fixtureManifest();
+  assert.equal(await store.load(), true);
+  assert.equal(store.stale, false);
+
+  // Without any prior valid snapshot, failure stays unavailable.
+  const emptyStore = new ManifestStore(app);
+  manifest = { ...fixtureManifest(), indexes: {} };
+  assert.equal(await emptyStore.load(), false);
+  assert.equal(emptyStore.data, null);
+  assert.equal(emptyStore.stale, false);
+  assert.deepEqual(emptyStore.modules(), []);
+
+  let releaseOld;
+  let reads = 0;
+  const concurrent = new ManifestStore({ vault: { adapter: {
+    exists: async () => true,
+    read: async () => {
+      if (reads++ === 0) return new Promise(resolve => { releaseOld = resolve; });
+      const next = fixtureManifest(); next._generated.snapshot_id = 'new-snapshot';
+      return JSON.stringify(next);
+    },
+  } } });
+  const older = concurrent.load();
+  while (!releaseOld) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await concurrent.load(), true);
+  const currentData = concurrent.data;
+  releaseOld(JSON.stringify(fixtureManifest()));
+  assert.equal(await older, false);
+  assert.equal(concurrent.snapshotId, 'new-snapshot');
+  assert.equal(concurrent.data, currentData, 'late load must not partially replace data or indexes');
+
+  let active = true;
+  const leased = new ManifestStore({ vault: { adapter: {
+    exists: async () => true,
+    read: async () => { active = false; return JSON.stringify(fixtureManifest()); },
+  } } }, () => active);
+  assert.equal(await leased.load(), false);
+  assert.equal(leased.data, null);
+  assert.equal(leased.snapshotId, null);
+  assert.deepEqual(leased.modules(), []);
 
   console.log('ManifestStore indexes OK: cached reads preserve filtering, search, and atomic failure semantics.');
 })().catch((error) => {

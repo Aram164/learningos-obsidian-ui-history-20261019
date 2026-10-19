@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { withRenderFocus } from '../accessibility/render-focus';
 import { selectTab, selectComponent, renderSources } from '../features/module/actions';
 import { renderLogistics, deadlinesFor, renderAcademicDates, renderDeadlineRows } from '../features/module/logistics';
@@ -132,6 +133,7 @@ export class ModuleView extends ItemView {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-module-view',

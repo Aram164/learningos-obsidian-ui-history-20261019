@@ -136,6 +136,8 @@ export class LearningOSUI extends Plugin implements AppSurface {
   private settingsCoordinator: SettingsSaveCoordinator | null = null;
   private lifecycleGeneration = 0;
   private lifecycleLive = false;
+  private refreshRequested = false;
+  private refreshTask: Promise<void> | null = null;
 
   isLifecycleActive(): boolean {
     return this.lifecycleLive
@@ -183,6 +185,7 @@ export class LearningOSUI extends Plugin implements AppSurface {
     const loadedSettings = await this.loadData<
       Partial<LearningOSSettings> | null
     >();
+    if (!this.isLifecycleActive()) return;
     const savedSettings = loadedSettings ?? {};
 
     this.settings = {
@@ -196,7 +199,8 @@ export class LearningOSUI extends Plugin implements AppSurface {
       () => this.persistSettings(),
     );
     const recoveryState = await this.recovery.load();
-    this.store = new ManifestStore(this.app);
+    if (!this.isLifecycleActive()) return;
+    this.store = new ManifestStore(this.app, () => this.isLifecycleActive());
     this.runtime = new LosRuntime(this.app, () => this.settings.pythonPath);
     this.resources = new ResourceOpener(this.app);
     this.materials = new MaterialTree(this.app);
@@ -217,6 +221,7 @@ export class LearningOSUI extends Plugin implements AppSurface {
       this.resources,
     );
     await this.store.load();
+    if (!this.isLifecycleActive()) return;
     registerApplication(this);
     await this.resumeInterruptedWrite(recoveryState);
   }
@@ -494,16 +499,37 @@ export class LearningOSUI extends Plugin implements AppSurface {
   }
 
   async reloadStore() {
+    this.gateway.assertLifecycleActive();
     const ok = await this.store.load();
-    if (!ok) throw new Error(this.store.error);
+    this.gateway.assertLifecycleActive();
     this.app.workspace.iterateAllLeaves(
       (leaf: WorkspaceLeaf) => leaf.view?.render?.(),
     );
+    if (!ok) throw new Error(this.store.error);
+  }
+
+  /** Event-driven refreshes share the mutation queue and coalesce bursts. */
+  requestManifestRefresh(): void {
+    if (!this.isLifecycleActive()) return;
+    this.refreshRequested = true;
+    if (this.refreshTask) return;
+    this.refreshTask = Promise.resolve().then(() => this.gateway.enqueue(async () => {
+      while (this.refreshRequested && this.isLifecycleActive()) {
+        this.refreshRequested = false;
+        try { await this.reloadStore(); }
+        catch (error: unknown) { this.notify(errorMessage(error)); }
+      }
+    })).catch((error: unknown) => this.notify(errorMessage(error)))
+      .finally(() => {
+        this.refreshTask = null;
+        if (this.refreshRequested && this.isLifecycleActive()) this.requestManifestRefresh();
+      });
   }
 
   /** Reload without throwing: the snapshot now visible, or null. */
   private async observedSnapshot(): Promise<string | null> {
     const ok = await this.store.load();
+    this.gateway.assertLifecycleActive();
     this.app.workspace.iterateAllLeaves(
       (leaf: WorkspaceLeaf) => leaf.view?.render?.(),
     );
@@ -526,6 +552,13 @@ export class LearningOSUI extends Plugin implements AppSurface {
   ): Promise<void> {
     if (!confirmation) return;
     this.gateway.assertLifecycleActive();
+    const owner = this.recovery.replayable();
+    if (!owner || owner.record.phase !== 'confirmed'
+        || owner.envelope.request_id !== confirmation.request_id
+        || owner.envelope.idempotency_key !== confirmation.idempotency_key
+        || owner.envelope.capability !== confirmation.capability) {
+      throw new Error('The confirmed result no longer owns the Gateway recovery request.');
+    }
     let observed = await this.observedSnapshot();
     this.gateway.assertLifecycleActive();
     let rebuildSucceeded = false;
@@ -552,7 +585,7 @@ export class LearningOSUI extends Plugin implements AppSurface {
       await this.recovery.markBlocked({
         code: 'PROJECTION_FAILED',
         message: detail,
-      });
+      }, owner);
       this.recoveryBlocked = true;
       throw new GatewayError(
         'LearningOS committed the write but cannot load a projection that shows it. Your draft was kept. Open Diagnostics → Gateway recovery.',
@@ -563,7 +596,7 @@ export class LearningOSUI extends Plugin implements AppSurface {
     if (observed !== confirmation.snapshot_after) {
       new Notice('Recovered the prior write; newer canonical changes are also present.');
     }
-    await this.recovery.settleConfirmed();
+    await this.recovery.settleConfirmed(owner);
     // The record retired, so the recovery actually settled: only now may the
     // stream claim it. Restart paths stashed no trace and emit nothing here.
     this.gateway.noteSettlementObserved(confirmation);
@@ -649,9 +682,11 @@ export class LearningOSUI extends Plugin implements AppSurface {
 
   async generate() {
     try {
-      await this.mutate(async () => {
+      await this.gateway.enqueue(async () => {
+        this.gateway.assertLifecycleActive();
         await this.gateway.call(['validate'], { expectJson: false });
         await this.gateway.call(['generate'], { expectJson: false });
+        await this.reloadStore();
       });
       new Notice('LearningOS projection rebuilt.');
     } catch (error: unknown) {

@@ -19,6 +19,22 @@ type CardHost = {
   };
 };
 
+/** Keep retained projection data visibly distinct from a successful refresh. */
+export function manifestFreshness(
+  parent: HTMLElement,
+  store: Pick<ManifestStore, 'stale' | 'error'>,
+): void {
+  if (!store.stale) return;
+  const banner = parent.createDiv({
+    cls: 'los-callout los-stale-notice',
+    attr: { role: 'status', 'aria-live': 'polite' },
+  });
+  banner.createEl('strong', { text: 'Showing the last validated view.' });
+  banner.createEl('p', {
+    text: `Refresh failed. Rebuild the projection before making changes. ${store.error}`,
+  });
+}
+
 /*
  * The DOM node type every component takes and returns.
  *

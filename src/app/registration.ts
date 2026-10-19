@@ -53,6 +53,8 @@ export const APPLICATION_VIEW_TYPES = [
 type ApplicationPlugin = Plugin & AppSurface & {
   readonly activeNav: string;
   setActiveNav(key: string): void;
+  isLifecycleActive(): boolean;
+  requestManifestRefresh(): void;
 };
 
 export function detachLegacyViews(plugin: ApplicationPlugin): void {
@@ -61,6 +63,7 @@ export function detachLegacyViews(plugin: ApplicationPlugin): void {
 
 /** Register the Obsidian host surface; feature behavior remains in its module. */
 export function registerApplication(plugin: ApplicationPlugin): void {
+  if (!plugin.isLifecycleActive()) return;
   detachLegacyViews(plugin);
   plugin.registerView(VIEW_HOME, (leaf: WorkspaceLeaf) => new HomeView(leaf, plugin));
   plugin.registerView(VIEW_NAV, (leaf: WorkspaceLeaf) => new NavView(leaf, plugin));
@@ -79,6 +82,7 @@ export function registerApplication(plugin: ApplicationPlugin): void {
 
   // Native tab attention is a display fact, not a navigation or persistence action.
   plugin.registerEvent(plugin.app.workspace.on('active-leaf-change', (leaf) => {
+    if (!plugin.isLifecycleActive()) return;
     const state = leaf?.getViewState();
     if (!state || state.type === VIEW_NAV
       || !APPLICATION_VIEW_TYPES.some((type) => type === state.type)) return;
@@ -86,6 +90,20 @@ export function registerApplication(plugin: ApplicationPlugin): void {
     const nav = plugin.router.descriptor(route).nav;
     if (nav !== plugin.activeNav) plugin.setActiveNav(nav);
   }));
+
+  for (const event of ['create', 'modify', 'delete'] as const) {
+    plugin.registerEvent(plugin.app.vault.on(event, (file) => {
+      if (file.path === 'generated/manifest.json') plugin.requestManifestRefresh();
+    }));
+  }
+  plugin.registerEvent(plugin.app.vault.on('rename', (file, oldPath) => {
+    if (file.path === 'generated/manifest.json' || oldPath === 'generated/manifest.json') {
+      plugin.requestManifestRefresh();
+    }
+  }));
+  if (typeof window !== 'undefined') {
+    plugin.registerDomEvent(window, 'focus', () => plugin.requestManifestRefresh());
+  }
 
   plugin.addSettingTab(new LearningOSSettingsTab(plugin.app, plugin));
   plugin.addRibbonIcon('route', 'Open LearningOS', () => plugin.nav.openHome());
@@ -109,6 +127,7 @@ export function registerApplication(plugin: ApplicationPlugin): void {
   applyPalette(document.body, plugin.settings.palette);
 
   plugin.app.workspace.onLayoutReady(async () => {
+    if (!plugin.isLifecycleActive()) return;
     // Applied again once the layout exists. The call above runs during
     // registration, before any view is mounted; repeating it here costs one
     // attribute write and removes a whole class of "the setting is saved but
@@ -116,6 +135,7 @@ export function registerApplication(plugin: ApplicationPlugin): void {
     applyPalette(document.body, plugin.settings.palette);
     detachLegacyViews(plugin);
     await plugin.router.openNavigator();
+    if (!plugin.isLifecycleActive()) return;
     plugin.app.workspace.leftSplit?.setSize?.(280);
     if (plugin.settings.collapseSidebars) plugin.app.workspace.rightSplit?.collapse();
     if (plugin.settings.openHomeOnStartup) await plugin.router.restore();

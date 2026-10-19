@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { ItemView, type WorkspaceLeaf } from 'obsidian';
 import { icon } from '../components';
 import { VIEW_NAV } from '../constants';
@@ -96,7 +97,8 @@ export class NavView extends ItemView {
   }
 
   render() {
-    const root = this.contentEl; root.empty(); root.addClass('los-root', 'los-app-nav');
+    const root = this.contentEl; root.empty();
+    manifestFreshness(root, this.plugin.store); root.addClass('los-root', 'los-app-nav');
     const brand = root.createDiv({ cls: 'los-nav-brand' });
     icon(brand.createSpan({ cls: 'los-brand-mark' }), 'route');
     brand.createEl('strong', { text: 'LearningOS' });

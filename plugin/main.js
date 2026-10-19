@@ -33398,6 +33398,17 @@ function safeWebUrl(value) {
 }
 
 // src/components.ts
+function manifestFreshness(parent, store) {
+  if (!store.stale) return;
+  const banner = parent.createDiv({
+    cls: "los-callout los-stale-notice",
+    attr: { role: "status", "aria-live": "polite" }
+  });
+  banner.createEl("strong", { text: "Showing the last validated view." });
+  banner.createEl("p", {
+    text: `Refresh failed. Rebuild the projection before making changes. ${store.error}`
+  });
+}
 function icon(el, name) {
   el.setAttrs({
     "aria-hidden": "true",
@@ -35962,6 +35973,7 @@ var LAYOUTS = [
 ];
 function renderAbilityMap(root, host) {
   root.empty();
+  manifestFreshness(root, host.plugin.store);
   root.addClass("los-root", "los-ability-view");
   const { plugin } = host;
   if (!plugin.store.ready) {
@@ -39122,6 +39134,7 @@ function renderConceptSeed(parent, host, graph, conceptId) {
 function renderAtlas(root, host) {
   const domainLens = host.state.lens === "domains";
   root.empty();
+  manifestFreshness(root, host.plugin.store);
   root.addClass("los-root", "los-atlas-view");
   root.toggleClass("los-domain-view", domainLens);
   if (domainLens) {
@@ -39599,6 +39612,7 @@ var BoundaryView = class extends import_obsidian6.ItemView {
   render() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass("los-root", "los-boundary-view");
     if (this.boundaryId === "program-masters-planning") {
       this.renderMastersPlanning(root);
@@ -39904,6 +39918,7 @@ var GardenView = class extends import_obsidian8.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-garden-view"
@@ -40630,6 +40645,7 @@ var HomeView = class extends import_obsidian9.ItemView {
   render() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-home"
@@ -43906,6 +43922,7 @@ var LibraryView = class extends import_obsidian10.ItemView {
       direction: active.selectionDirection
     } : null;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-library-view"
@@ -45261,6 +45278,7 @@ var ModuleView = class extends import_obsidian11.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-module-view"
@@ -45427,6 +45445,7 @@ var NavView = class extends import_obsidian12.ItemView {
   render() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass("los-root", "los-app-nav");
     const brand = root.createDiv({ cls: "los-nav-brand" });
     icon(brand.createSpan({ cls: "los-brand-mark" }), "route");
@@ -45547,6 +45566,7 @@ var ProgramView = class extends import_obsidian13.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass("los-root", "los-program-view");
     if (!this.plugin.store.ready) {
       pageHeader(
@@ -46532,6 +46552,7 @@ var ProjectLinkReasonModal = class extends import_obsidian14.Modal {
   onOpen() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-linked-reason-modal"
@@ -46664,6 +46685,7 @@ var ProjectView = class extends import_obsidian14.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-project-view"
@@ -47308,37 +47330,50 @@ var MemoryGatewayRecoveryStore = class {
   async write(entry) {
     this.current = entry;
   }
-  required() {
+  required(expected) {
     if (!this.current) throw new Error("There is no prepared Gateway request to advance.");
+    if (expected !== void 0 && this.current !== expected) {
+      throw new Error("The Gateway recovery request or phase changed; the older result was ignored.");
+    }
     return this.current;
   }
   async begin(next) {
+    const previous = this.replayable();
     const validated = await validateGatewayRecoveryRecord(next);
     if (!validated.ok) throw new Error(`Refusing to persist an invalid recovery record: ${validated.error}`);
+    if (this.replayable() !== previous) {
+      throw new Error("The Gateway recovery request changed while preparing this write.");
+    }
     await this.write(validated.entry);
   }
-  async markRecovering(error) {
-    const { record: stored, envelope } = this.required();
+  async markRecovering(error, expected) {
+    const { record: stored, envelope } = this.required(expected);
     await this.write({
       record: { ...stored, phase: "recovering", last_error: error },
       envelope
     });
   }
-  async markConfirmed(confirmation) {
-    const { record: stored, envelope } = this.required();
+  async markConfirmed(confirmation, expected) {
+    const { record: stored, envelope } = this.required(expected);
+    asGatewaySuccessV2(confirmation, {
+      requestId: envelope.request_id,
+      idempotencyKey: envelope.idempotency_key,
+      capability: envelope.capability
+    });
     await this.write({
       record: { ...stored, phase: "confirmed", confirmation, last_error: null },
       envelope
     });
   }
-  async markBlocked(error) {
-    const { record: stored, envelope } = this.required();
+  async markBlocked(error, expected) {
+    const { record: stored, envelope } = this.required(expected);
     await this.write({
       record: { ...stored, phase: "blocked", last_error: error },
       envelope
     });
   }
-  async discardRefused() {
+  async discardRefused(expected) {
+    if (expected !== void 0) this.required(expected);
     await this.write(null);
   }
 };
@@ -47349,6 +47384,7 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
     this.persist = persist;
   }
   status = { kind: "clear" };
+  saveVersion = 0;
   get unresolved() {
     return this.status.kind !== "clear";
   }
@@ -47367,12 +47403,17 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
    * evidence survives for Diagnostics and no write process is launched.
    */
   async load() {
+    const version = this.saveVersion;
     const raw = this.settings.gatewayRecovery;
     if (raw === null || raw === void 0) {
+      this.current = null;
+      this.saveVersion += 1;
       this.status = { kind: "clear" };
       return this.status;
     }
     const validated = await validateGatewayRecoveryRecord(raw);
+    if (version !== this.saveVersion || this.settings.gatewayRecovery !== raw) return this.status;
+    this.saveVersion += 1;
     this.current = validated.ok ? validated.entry : null;
     this.status = validated.ok ? { kind: "record", entry: validated.entry } : { kind: "malformed", error: validated.error };
     return this.status;
@@ -47396,16 +47437,22 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
     const previousSlot = this.settings.gatewayRecovery;
     const previousCurrent = this.current;
     const previousStatus = this.status;
+    const version = ++this.saveVersion;
     this.settings.gatewayRecovery = entry ? entry.record : null;
     this.current = entry;
     this.status = entry ? { kind: "record", entry } : { kind: "clear" };
     try {
       await this.persist();
     } catch (error) {
-      this.settings.gatewayRecovery = previousSlot;
-      this.current = previousCurrent;
-      this.status = previousStatus;
+      if (this.saveVersion === version) {
+        this.settings.gatewayRecovery = previousSlot;
+        this.current = previousCurrent;
+        this.status = previousStatus;
+      }
       throw error;
+    }
+    if (this.saveVersion !== version) {
+      throw new Error("The Gateway recovery state changed during the save; the older transition was ignored.");
     }
   }
   /**
@@ -47419,13 +47466,18 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
    * and every draft this settlement cleared, so the learner's text is not
    * silently destroyed by a settlement that never reached disk.
    */
-  async settleConfirmed() {
+  async settleConfirmed(expected) {
     const entry = this.replayable();
-    if (!entry) return;
+    if (!entry && expected === void 0) return;
+    this.required(expected);
+    if (!entry || entry.record.phase !== "confirmed") {
+      throw new Error("Only a confirmed Gateway request can be settled.");
+    }
     const previousSlot = this.settings.gatewayRecovery;
     const previousCurrent = this.current;
     const previousStatus = this.status;
     const previousDrafts = structuredClone(this.settings.uiDrafts);
+    const version = ++this.saveVersion;
     clearDraftsOwnedBy(this.settings.uiDrafts, entry.envelope);
     const postCleanupDrafts = structuredClone(this.settings.uiDrafts);
     this.settings.gatewayRecovery = null;
@@ -47434,6 +47486,7 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
     try {
       await this.persist();
     } catch (error) {
+      if (this.saveVersion !== version) throw error;
       this.settings.gatewayRecovery = previousSlot;
       this.current = previousCurrent;
       this.status = previousStatus;
@@ -47459,6 +47512,9 @@ var SettingsGatewayRecoveryStore = class extends MemoryGatewayRecoveryStore {
         }
       }
       throw error;
+    }
+    if (this.saveVersion !== version) {
+      throw new Error("The Gateway recovery state changed during settlement; the older result was ignored.");
     }
   }
 };
@@ -47602,7 +47658,7 @@ var import_node_process = __toESM(require("node:process"));
 
 // src/build-identity.ts
 function runtimeSourceFingerprint() {
-  return true ? "sha256:6be785e8562c6d2008946f0d2433b707da5761ebb089a9204a7b20a6b0329355" : "unavailable";
+  return true ? "sha256:e7a88e56c7873b1c4e9f51374443ca66ebf2e193406911dc54aff66136dd1ed7" : "unavailable";
 }
 function runtimeContractVersion() {
   return true ? 15 : 0;
@@ -47759,12 +47815,27 @@ var GatewayClient = class {
    */
   assertMutationAllowed() {
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     if (!this.recovery.unresolved) return;
     throw new GatewayError(
       "LearningOS has an unresolved Gateway write and will not start another until it is settled. Open Diagnostics \u2192 Gateway recovery.",
       null,
       { code: "RECOVERY_REQUIRED", retryable: false }
     );
+  }
+  assertFreshSnapshot() {
+    if (this.plugin.store.stale) {
+      throw new Error("LearningOS is showing a stale snapshot after a failed refresh; reload it before writing \u2014 nothing was written.");
+    }
+  }
+  assertRecoveryOwner(owner) {
+    if (owner !== void 0 && this.recovery.replayable() !== owner) {
+      throw new GatewayError(
+        "The Gateway recovery request or phase changed; the older response was ignored.",
+        null,
+        { code: "RECOVERY_REQUIRED", retryable: false }
+      );
+    }
   }
   /**
    * Serialize every mutation, wherever it was clicked. Failures do not poison
@@ -47866,6 +47937,7 @@ var GatewayClient = class {
         { code: "UNCONFIRMED", retryable: false }
       );
     }
+    this.assertFreshSnapshot();
     const expectedSnapshot = options.expectedSnapshot || this.snapshotId();
     if (!isSha256(expectedSnapshot)) {
       throw new GatewayError(
@@ -47916,6 +47988,7 @@ var GatewayClient = class {
   }
   async prepareCapability(name, payload, expectedSnapshot, expectedRevisions, trace, identity) {
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     const requestId = identity?.requestId ?? nextRequestId(name);
     const idempotencyKey = identity?.idempotencyKey ?? nextIdempotencyKey(requestId);
     const effectiveRevisions = isRequestScopedCapability(name) ? { [requestArtifactId(name, idempotencyKey)]: 0 } : expectedRevisions;
@@ -47941,6 +48014,7 @@ var GatewayClient = class {
     };
     const envelopeJson = JSON.stringify(envelope);
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     await this.recovery.begin({
       schema_version: 1,
       phase: "prepared",
@@ -47975,6 +48049,14 @@ var GatewayClient = class {
    */
   async dispatchPreparedEnvelope(envelopeJson, { replayOnly = false, trace } = {}) {
     this.assertLifecycleActive();
+    const owner = this.recovery.replayable();
+    if (owner && owner.record.envelope_json !== envelopeJson) {
+      throw new GatewayError(
+        "The prepared envelope does not own the current recovery request.",
+        null,
+        { code: "RECOVERY_REQUIRED", retryable: false }
+      );
+    }
     const attemptCtx = trace === void 0 ? newOperationContext() : childAttemptContext(trace);
     const attempt = formatTraceparent(attemptCtx);
     const received = (result) => {
@@ -47984,7 +48066,7 @@ var GatewayClient = class {
         code,
         replayed: result.outcome === "confirmed" ? result.confirmation.replayed : false
       }, attemptCtx.spanId));
-      return result;
+      return { ...result, recoveryOwner: owner };
     };
     let envelope;
     try {
@@ -48075,10 +48157,11 @@ var GatewayClient = class {
     if (!entry) {
       return {
         outcome: "ambiguous",
+        recoveryOwner: null,
         error: { code: "RECOVERY_REQUIRED", message: "There is no replayable Gateway request." }
       };
     }
-    await this.recovery.markRecovering(entry.record.last_error);
+    await this.recovery.markRecovering(entry.record.last_error, entry);
     const result = await this.dispatchPreparedEnvelope(
       entry.record.envelope_json,
       trace === void 0 ? {} : { trace }
@@ -48086,6 +48169,7 @@ var GatewayClient = class {
     if (result.outcome !== "refused") return result;
     return {
       outcome: "ambiguous",
+      recoveryOwner: result.recoveryOwner ?? null,
       error: {
         code: result.failure.error.code,
         message: `The recovery attempt was refused (${result.failure.error.code}): ${result.failure.error.message}`
@@ -48106,6 +48190,7 @@ var GatewayClient = class {
     if (!entry || entry.record.confirmation === null) {
       return {
         outcome: "ambiguous",
+        recoveryOwner: entry,
         error: {
           code: "RECOVERY_REQUIRED",
           message: "There is no persisted confirmation for Core to verify."
@@ -48122,6 +48207,7 @@ var GatewayClient = class {
     if (result.outcome === "confirmed") {
       return {
         outcome: "ambiguous",
+        recoveryOwner: result.recoveryOwner ?? null,
         error: {
           code: "UNVERIFIED_CONFIRMATION",
           message: "Core returned a non-replay response to a receipt-only lookup."
@@ -48131,6 +48217,7 @@ var GatewayClient = class {
     if (result.outcome === "refused") {
       return {
         outcome: "ambiguous",
+        recoveryOwner: result.recoveryOwner ?? null,
         error: {
           code: result.failure.error.code,
           message: `Core could not verify the persisted receipt (${result.failure.error.code}): ${result.failure.error.message}`
@@ -48159,7 +48246,8 @@ var GatewayClient = class {
     let result = await this.dispatchPreparedEnvelope(envelopeJson, { trace: operation });
     if (result.outcome === "ambiguous") {
       this.announce(GATEWAY_RECOVERY_NOTICE);
-      await this.recovery.markRecovering(result.error);
+      this.assertRecoveryOwner(result.recoveryOwner);
+      await this.recovery.markRecovering(result.error, result.recoveryOwner ?? void 0);
       result = await this.recoverPreparedEnvelope(operation);
     }
     return this.settle(result, operation);
@@ -48190,6 +48278,15 @@ var GatewayClient = class {
   /** Turn one settled outcome into the record state and the caller's answer. */
   async settle(result, trace) {
     this.assertLifecycleActive();
+    this.assertRecoveryOwner(result.recoveryOwner);
+    const owner = result.recoveryOwner ?? this.recovery.replayable() ?? void 0;
+    if (owner && result.outcome === "refused" && (result.failure.request_id !== owner.envelope.request_id || result.failure.idempotency_key !== owner.envelope.idempotency_key || result.failure.capability !== owner.envelope.capability)) {
+      throw new GatewayError(
+        "The refusal does not belong to the current Gateway request.",
+        null,
+        { code: "RECOVERY_REQUIRED", retryable: false }
+      );
+    }
     const terminal = (name, outcome, code) => {
       if (trace === void 0) return;
       this.diagnose(diagnosticEvent(trace, name, {
@@ -48201,12 +48298,12 @@ var GatewayClient = class {
       }));
     };
     if (result.outcome === "confirmed") {
-      await this.recovery.markConfirmed(result.confirmation);
+      await this.recovery.markConfirmed(result.confirmation, owner);
       this.pendingObservation = trace === void 0 ? null : { trace, requestId: result.confirmation.request_id };
       return result.confirmation;
     }
     if (result.outcome === "refused") {
-      await this.recovery.discardRefused();
+      await this.recovery.discardRefused(owner);
       terminal("recovery.settled", "refused", result.failure.error.code);
       throw new GatewayError(
         result.failure.error.message,
@@ -48217,7 +48314,7 @@ var GatewayClient = class {
         }
       );
     }
-    await this.recovery.markBlocked(result.error);
+    await this.recovery.markBlocked(result.error, owner);
     terminal("recovery.blocked", "blocked", result.error.code);
     throw new GatewayError(
       // The last thing Core said travels with the refusal. The learner cannot
@@ -48235,6 +48332,7 @@ Last response: ${result.error.message}`,
    * a misleading message, or worse, matched by accident.
    */
   snapshotId() {
+    this.assertFreshSnapshot();
     const snapshotId = this.plugin.store.snapshotId;
     if (!snapshotId) {
       throw new Error("LearningOS has no loaded snapshot to guard this change against; nothing was written.");
@@ -48945,6 +49043,7 @@ var ReviewView = class extends import_obsidian16.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       "los-root",
       "los-review-view"
@@ -49360,6 +49459,7 @@ var DiagnosticsView = class extends import_obsidian16.ItemView {
   renderContent() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass("los-root", "los-diagnostics-view");
     pageHeader(root, "More", "Diagnostics");
     const tabs = root.createDiv({ cls: "los-subtabs", attr: { "aria-label": "Diagnostics sections" } });
@@ -49715,6 +49815,7 @@ var ShelvingView = class extends import_obsidian17.ItemView {
   render() {
     const root = this.contentEl;
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass("los-root", "los-shelving-view");
     const unit = this.unitId ? this.plugin.store.get(this.unitId) : null;
     pageHeader(
@@ -51938,6 +52039,7 @@ function asPlanTemplate(result) {
 function render(view) {
   const root = view.contentEl;
   root.empty();
+  manifestFreshness(root, view.plugin.store);
   root.addClass(
     "los-root",
     "los-unit-view"
@@ -52381,6 +52483,7 @@ function detachLegacyViews(plugin) {
   for (const type of LEGACY_VIEW_TYPES) plugin.app.workspace.detachLeavesOfType(type);
 }
 function registerApplication(plugin) {
+  if (!plugin.isLifecycleActive()) return;
   detachLegacyViews(plugin);
   plugin.registerView(VIEW_HOME, (leaf) => new HomeView(leaf, plugin));
   plugin.registerView(VIEW_NAV, (leaf) => new NavView(leaf, plugin));
@@ -52397,12 +52500,26 @@ function registerApplication(plugin) {
   plugin.registerView(VIEW_GARDEN, (leaf) => new GardenView(leaf, plugin));
   plugin.registerView(VIEW_DIAGNOSTICS, (leaf) => new DiagnosticsView(leaf, plugin));
   plugin.registerEvent(plugin.app.workspace.on("active-leaf-change", (leaf) => {
+    if (!plugin.isLifecycleActive()) return;
     const state = leaf?.getViewState();
     if (!state || state.type === VIEW_NAV || !APPLICATION_VIEW_TYPES.some((type) => type === state.type)) return;
     const route2 = plugin.router.fromLegacy(state);
     const nav = plugin.router.descriptor(route2).nav;
     if (nav !== plugin.activeNav) plugin.setActiveNav(nav);
   }));
+  for (const event of ["create", "modify", "delete"]) {
+    plugin.registerEvent(plugin.app.vault.on(event, (file) => {
+      if (file.path === "generated/manifest.json") plugin.requestManifestRefresh();
+    }));
+  }
+  plugin.registerEvent(plugin.app.vault.on("rename", (file, oldPath) => {
+    if (file.path === "generated/manifest.json" || oldPath === "generated/manifest.json") {
+      plugin.requestManifestRefresh();
+    }
+  }));
+  if (typeof window !== "undefined") {
+    plugin.registerDomEvent(window, "focus", () => plugin.requestManifestRefresh());
+  }
   plugin.addSettingTab(new LearningOSSettingsTab(plugin.app, plugin));
   plugin.addRibbonIcon("route", "Open LearningOS", () => plugin.nav.openHome());
   plugin.addCommand({ id: "open-home", name: "Open Home", callback: () => plugin.nav.openHome() });
@@ -52420,9 +52537,11 @@ function registerApplication(plugin) {
   plugin.addCommand({ id: "end-learning-session", name: "End learning session safely", callback: () => plugin.reviewSessionEnd() });
   applyPalette(document.body, plugin.settings.palette);
   plugin.app.workspace.onLayoutReady(async () => {
+    if (!plugin.isLifecycleActive()) return;
     applyPalette(document.body, plugin.settings.palette);
     detachLegacyViews(plugin);
     await plugin.router.openNavigator();
+    if (!plugin.isLifecycleActive()) return;
     plugin.app.workspace.leftSplit?.setSize?.(280);
     if (plugin.settings.collapseSidebars) plugin.app.workspace.rightSplit?.collapse();
     if (plugin.settings.openHomeOnStartup) await plugin.router.restore();
@@ -54216,25 +54335,30 @@ function buildStoreIndexes(manifest, records) {
   };
 }
 var ManifestStore = class {
-  app;
-  indexes;
-  ready;
-  error;
-  data;
-  records;
-  byId;
-  contractVersion = null;
-  snapshotId = null;
-  constructor(app) {
+  constructor(app, canPublish = () => true) {
+    this.canPublish = canPublish;
     this.app = app;
     this.ready = false;
+    this.stale = false;
     this.error = "";
     this.data = null;
     this.records = [];
     this.byId = /* @__PURE__ */ new Map();
     this.indexes = emptyStoreIndexes();
   }
+  app;
+  indexes;
+  ready;
+  stale;
+  error;
+  data;
+  records;
+  byId;
+  contractVersion = null;
+  snapshotId = null;
+  loadVersion = 0;
   async load() {
+    const request = ++this.loadVersion;
     try {
       if (!await this.app.vault.adapter.exists("generated/manifest.json")) {
         throw new Error("Projection unavailable \u2014 rebuild it to continue.");
@@ -54278,6 +54402,7 @@ var ManifestStore = class {
         }
       }
       const indexes = buildStoreIndexes(manifest, records);
+      if (request !== this.loadVersion || !this.canPublish()) return false;
       this.data = manifest;
       this.contractVersion = version;
       this.snapshotId = manifest._generated.snapshot_id;
@@ -54285,11 +54410,19 @@ var ManifestStore = class {
       this.byId = byId;
       this.indexes = indexes;
       this.ready = true;
+      this.stale = false;
       this.error = "";
       return true;
     } catch (error) {
-      this.ready = false;
+      if (request !== this.loadVersion || !this.canPublish()) return false;
       this.error = error instanceof Error ? error.message : String(error);
+      if (this.data !== null) {
+        this.stale = true;
+        this.ready = true;
+        return false;
+      }
+      this.ready = false;
+      this.stale = false;
       this.data = null;
       this.records = [];
       this.byId = /* @__PURE__ */ new Map();
@@ -54619,6 +54752,8 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
   settingsCoordinator = null;
   lifecycleGeneration = 0;
   lifecycleLive = false;
+  refreshRequested = false;
+  refreshTask = null;
   isLifecycleActive() {
     return this.lifecycleLive && this.settingsCoordinator?.generation === this.lifecycleGeneration;
   }
@@ -54651,6 +54786,7 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
     await coordinator.tail;
     if (!this.isLifecycleActive()) return;
     const loadedSettings = await this.loadData();
+    if (!this.isLifecycleActive()) return;
     const savedSettings = loadedSettings ?? {};
     this.settings = {
       ...DEFAULT_SETTINGS,
@@ -54663,7 +54799,8 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
       () => this.persistSettings()
     );
     const recoveryState = await this.recovery.load();
-    this.store = new ManifestStore(this.app);
+    if (!this.isLifecycleActive()) return;
+    this.store = new ManifestStore(this.app, () => this.isLifecycleActive());
     this.runtime = new LosRuntime(this.app, () => this.settings.pythonPath);
     this.resources = new ResourceOpener(this.app);
     this.materials = new MaterialTree(this.app);
@@ -54684,6 +54821,7 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
       this.resources
     );
     await this.store.load();
+    if (!this.isLifecycleActive()) return;
     registerApplication(this);
     await this.resumeInterruptedWrite(recoveryState);
   }
@@ -54917,15 +55055,37 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
     }
   }
   async reloadStore() {
+    this.gateway.assertLifecycleActive();
     const ok = await this.store.load();
-    if (!ok) throw new Error(this.store.error);
+    this.gateway.assertLifecycleActive();
     this.app.workspace.iterateAllLeaves(
       (leaf) => leaf.view?.render?.()
     );
+    if (!ok) throw new Error(this.store.error);
+  }
+  /** Event-driven refreshes share the mutation queue and coalesce bursts. */
+  requestManifestRefresh() {
+    if (!this.isLifecycleActive()) return;
+    this.refreshRequested = true;
+    if (this.refreshTask) return;
+    this.refreshTask = Promise.resolve().then(() => this.gateway.enqueue(async () => {
+      while (this.refreshRequested && this.isLifecycleActive()) {
+        this.refreshRequested = false;
+        try {
+          await this.reloadStore();
+        } catch (error) {
+          this.notify(errorMessage4(error));
+        }
+      }
+    })).catch((error) => this.notify(errorMessage4(error))).finally(() => {
+      this.refreshTask = null;
+      if (this.refreshRequested && this.isLifecycleActive()) this.requestManifestRefresh();
+    });
   }
   /** Reload without throwing: the snapshot now visible, or null. */
   async observedSnapshot() {
     const ok = await this.store.load();
+    this.gateway.assertLifecycleActive();
     this.app.workspace.iterateAllLeaves(
       (leaf) => leaf.view?.render?.()
     );
@@ -54945,6 +55105,10 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
   async finishConfirmedWrite(confirmation) {
     if (!confirmation) return;
     this.gateway.assertLifecycleActive();
+    const owner = this.recovery.replayable();
+    if (!owner || owner.record.phase !== "confirmed" || owner.envelope.request_id !== confirmation.request_id || owner.envelope.idempotency_key !== confirmation.idempotency_key || owner.envelope.capability !== confirmation.capability) {
+      throw new Error("The confirmed result no longer owns the Gateway recovery request.");
+    }
     let observed = await this.observedSnapshot();
     this.gateway.assertLifecycleActive();
     let rebuildSucceeded = false;
@@ -54966,7 +55130,7 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
       await this.recovery.markBlocked({
         code: "PROJECTION_FAILED",
         message: detail
-      });
+      }, owner);
       this.recoveryBlocked = true;
       throw new GatewayError(
         "LearningOS committed the write but cannot load a projection that shows it. Your draft was kept. Open Diagnostics \u2192 Gateway recovery.",
@@ -54977,7 +55141,7 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
     if (observed !== confirmation.snapshot_after) {
       new import_obsidian27.Notice("Recovered the prior write; newer canonical changes are also present.");
     }
-    await this.recovery.settleConfirmed();
+    await this.recovery.settleConfirmed(owner);
     this.gateway.noteSettlementObserved(confirmation);
   }
   /** The active destination is a display fact, so the Navigator is the only
@@ -55043,9 +55207,11 @@ var LearningOSUI = class extends import_obsidian27.Plugin {
   }
   async generate() {
     try {
-      await this.mutate(async () => {
+      await this.gateway.enqueue(async () => {
+        this.gateway.assertLifecycleActive();
         await this.gateway.call(["validate"], { expectJson: false });
         await this.gateway.call(["generate"], { expectJson: false });
+        await this.reloadStore();
       });
       new import_obsidian27.Notice("LearningOS projection rebuilt.");
     } catch (error) {

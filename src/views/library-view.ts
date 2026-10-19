@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { renderRecordActions, renderAttachments, renderRelated, renderSourceDetail, renderTechnical } from '../features/library/detail';
 import { renderRecordRow, renderSourcePage, renderTopicPackPage, renderCataloguePage, renderOrderedCollection, renderLegacyList } from '../features/library/collections';
 import { renderHome, renderCollectionSwitch, renderGroup } from '../features/library/home';
@@ -245,6 +246,7 @@ export class LibraryView extends ItemView {
       : null;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-library-view',

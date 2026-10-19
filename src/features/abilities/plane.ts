@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../../components';
 import { button, empty, filterTabs } from '../../components';
 import { renderAtlasVariants } from '../atlas/domains';
 import { enableButtonGroupKeyboardNavigation } from '../../accessibility/button-group';
@@ -50,6 +51,7 @@ const LAYOUTS: ReadonlyArray<readonly [AbilityLayoutV1, string]> = [
  */
 export function renderAbilityMap(root: HTMLElement, host: AbilityHost): void {
   root.empty();
+    manifestFreshness(root, host.plugin.store);
   root.addClass('los-root', 'los-ability-view');
   const { plugin } = host;
 

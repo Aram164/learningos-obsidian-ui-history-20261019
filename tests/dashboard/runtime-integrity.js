@@ -58,6 +58,81 @@ function contrastRatio(left, right) {
 }
 
 module.exports = async function run() {
+  heading('review regressions: freshness and asynchronous startup ownership');
+  {
+    const { app, plugin } = await boot();
+    await tick();
+    await plugin.gateway.enqueue(() => undefined);
+    let loads = 0;
+    const load = plugin.store.load.bind(plugin.store);
+    plugin.store.load = async () => { loads += 1; return load(); };
+    app.vault.trigger('modify', { path: 'operations/diagnostics/traces.jsonl' });
+    await tick();
+    check('unrelated vault churn does not reload the projection', loads === 0);
+    for (let n = 0; n < 3; n += 1) app.vault.trigger('modify', { path: 'generated/manifest.json' });
+    await tick(); await plugin.gateway.enqueue(() => undefined);
+    check('manifest events coalesce into one projection reload', loads === 1);
+    plugin.onunload();
+    app.vault.trigger('delete', { path: 'generated/manifest.json' });
+    await tick();
+    check('unloaded vault callbacks cannot reload or publish the projection', loads === 1);
+  }
+  {
+    const { app, plugin, home } = await boot();
+    plugin.settings.uiDrafts.inbox = { title: 'Preserved', text: 'Unsaved learner text' };
+    const read = app.vault.adapter.read;
+    app.vault.adapter.read = async (name) => {
+      if (name === 'generated/manifest.json') throw new Error('review refresh failure');
+      return read(name);
+    };
+    let failed = false;
+    try { await plugin.reloadStore(); } catch (_) { failed = true; }
+    check('failed refresh redraws Home with an accessible stale indication',
+      failed && plugin.store.stale && plugin.store.ready
+      && home.view.contentEl.find('los-stale-notice').length === 1
+      && home.view.contentEl.allText().includes('Showing the last validated view.'));
+    check('failed refresh preserves the learner draft',
+      plugin.settings.uiDrafts.inbox.text === 'Unsaved learner text');
+    app.vault.adapter.read = read;
+    await plugin.generate();
+    check('projection maintenance remains available from a stale view',
+      !plugin.store.stale && home.view.contentEl.find('los-stale-notice').length === 0
+      && plugin.settings.uiDrafts.inbox.text === 'Unsaved learner text');
+    plugin.onunload();
+  }
+  for (const boundary of ['settings', 'manifest']) {
+    const app = makeApp(FIXTURE);
+    const plugin = new LearningOSUI(app); app._plugin = plugin;
+    let release = null;
+    if (boundary === 'settings') {
+      plugin.loadData = () => new Promise(resolve => { release = resolve; });
+    } else {
+      const read = app.vault.adapter.read;
+      app.vault.adapter.read = name => name === 'generated/manifest.json'
+        ? new Promise(resolve => { release = resolve; }) : read(name);
+    }
+    const starting = plugin.onload();
+    for (let n = 0; n < 100 && !release; n += 1) await tick();
+    if (!release) throw new Error(`startup never reached ${boundary} boundary`);
+    plugin.onunload();
+    release(boundary === 'settings' ? {} : fs.readFileSync(path.join(FIXTURE, 'generated/manifest.json'), 'utf8'));
+    await starting;
+    check(`unload during ${boundary} read prevents late view registration`,
+      !plugin.isLifecycleActive() && Object.keys(plugin.views).length === 0);
+    if (boundary === 'manifest') {
+      check('an unloaded instance cannot publish its pending manifest',
+        plugin.store.data === null && !plugin.store.ready && plugin.store.snapshotId === null);
+    }
+  }
+  {
+    const { app, plugin } = await build();
+    plugin.onunload();
+    await app.workspace._ready();
+    check('a late layout-ready callback cannot reopen disabled views',
+      app.workspace.getLeavesOfType(VIEW.home).length === 0
+      && app.workspace.getLeavesOfType(VIEW.nav).length === 0);
+  }
+
   heading('material consumer contract (red gate)');
   {
     const { plugin } = await boot();

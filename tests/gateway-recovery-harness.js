@@ -103,6 +103,44 @@ async function session(settingsFile, runLos) {
   return { gateway, recovery, settings, notices, snapshot };
 }
 
+/**
+ * The real Core with one injected fault: EIO at the receipt-parent
+ * synchronization, after the receipt is already visible. This is the
+ * production witness from Core's S1 campaign, delivered through a real
+ * child process — the UI receives Core's actual serialized response.
+ */
+function spawnCoreFaulted(args, stdin) {
+  const wrapper = [
+    'import glob, os, runpy, stat, sys',
+    'los, repo = sys.argv[1], sys.argv[2]',
+    'sys.argv = [los, "--root", repo] + sys.argv[3:]',
+    'real_fsync = os.fsync',
+    'receipt_glob = os.path.join(',
+    '    repo, "operations", "transactions", "transaction-*.yaml")',
+    'seen_receipts = set(glob.glob(receipt_glob))',
+    'def fake_fsync(fd):',
+    '    try:',
+    '        is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)',
+    '    except OSError:',
+    '        is_dir = False',
+    '    if is_dir and set(glob.glob(receipt_glob)) - seen_receipts:',
+    '        raise OSError(5, "injected receipt parent failure")',
+    '    return real_fsync(fd)',
+    'os.fsync = fake_fsync',
+    'runpy.run_path(los, run_name="__main__")',
+  ].join('\n');
+  const result = spawnSync(
+    python,
+    ['-c', wrapper, path.join(coreRoot, 'tools', 'los.py'), repo, ...args],
+    { cwd: repo, input: stdin ?? '', encoding: 'utf8', timeout: 180000 },
+  );
+  if (result.error) throw result.error;
+  const error = result.status === 0
+    ? null
+    : Object.assign(new Error(`los exited ${result.status}`), { code: result.status });
+  return { error, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
 /** A transport that hands the first request to Core and then loses the answer. */
 function interruptOnce(sent) {
   let interrupted = false;
@@ -251,6 +289,76 @@ scenarios.fileCaptureReplayAfterSourceChanged = async () => {
     attempts: sent.length,
     identical: sent[0] === sent[1],
     result: confirmation.result,
+  };
+};
+
+scenarios.faultedPublicationReplay = async () => {
+  const settingsFile = path.join(workspace, 'faulted-publication.json');
+  const sent = [];
+
+  // Session one: Core's receipt publication is faulted after visibility.
+  // The client classifies the real serialized response as ambiguous; its
+  // one in-session replay then loses its answer in transport, so the
+  // record must settle blocked — never retired, never replaced.
+  let dispatches = 0;
+  const first = await session(settingsFile, (args, callback, stdin) => {
+    if (stdin) {
+      sent.push(stdin);
+      dispatches += 1;
+      if (dispatches === 1) {
+        const result = spawnCoreFaulted(args, stdin);
+        callback(result.error, result.stdout, result.stderr);
+        return;
+      }
+      callback(Object.assign(new Error('the replay answer was lost'), { code: null }), '', '');
+      return;
+    }
+    const result = spawnCore(args, stdin);
+    callback(result.error, result.stdout, result.stderr);
+  });
+  let blockedError = null;
+  try {
+    await first.gateway.captureText('a thought with an uncertain receipt', 'Faulted');
+  } catch (error) {
+    blockedError = error;
+  }
+  assert.ok(blockedError, 'an uncertain publication must not report success');
+  const persisted = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(persisted.gatewayRecovery.phase, 'blocked',
+    'the unresolved recovery identity survives the faulted response');
+  assert.equal(persisted.gatewayRecovery.envelope_json, sent[0],
+    'the original serialized envelope survives byte for byte');
+  assert.equal(JSON.parse(sent[0]).payload.text, 'a thought with an uncertain receipt');
+  const blockedPhase = persisted.gatewayRecovery.phase;
+  const blockedCode = persisted.gatewayRecovery.last_error?.code ?? null;
+
+  // Session two: a fresh plugin instance replays the persisted bytes.
+  // Core reconciles the matching receipt and answers as a replay.
+  const replayedSent = [];
+  const restarted = await session(settingsFile, (args, callback, stdin) => {
+    if (stdin) replayedSent.push(stdin);
+    const result = spawnCore(args, stdin);
+    callback(result.error, result.stdout, result.stderr);
+  });
+  const outcome = await restarted.gateway.recoverPreparedEnvelope();
+  const confirmation = await restarted.gateway.settle(outcome);
+  assert.equal(replayedSent.length, 1);
+  assert.equal(replayedSent[0], sent[0], 'the restarted app resends the persisted bytes');
+  assert.equal(confirmation.replayed, true,
+    'Core must recognise the retry as the write it already performed');
+  return {
+    capability: 'capture.create',
+    transaction_id: confirmation.transaction_id,
+    receipt_path: confirmation.receipt_path,
+    idempotency_key: JSON.parse(sent[0]).idempotency_key,
+    replayed: confirmation.replayed,
+    attempts: sent.length + replayedSent.length,
+    identical: sent.every((bytes) => bytes === sent[0])
+      && replayedSent[0] === sent[0],
+    result: confirmation.result,
+    blocked_phase: blockedPhase,
+    blocked_code: blockedCode,
+    envelope_preserved: persisted.gatewayRecovery.envelope_json === sent[0],
   };
 };
 

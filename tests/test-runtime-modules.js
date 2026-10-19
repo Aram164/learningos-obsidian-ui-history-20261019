@@ -550,19 +550,26 @@ function routerPlugin(settings = {}) {
     assert.match(store.error, /\/module_concept_edges\/0\/evidence\/0 must NOT have additional properties/);
   });
 
-  await test('ManifestStore clears the prior snapshot after a reload failure', async () => {
+  await test('ManifestStore retains the prior snapshot, marked stale, after a reload failure', async () => {
     let valid = true;
     const store = new ManifestStore(manifestApp((text) => valid
       ? text
       : text.replace(`"contract_version": ${CONTRACT}`, '"contract_version": 1')));
     assert.equal(await store.load(), true);
     assert.ok(store.records.length > 0);
+    const retainedSnapshot = store.snapshotId;
     valid = false;
     assert.equal(await store.load(), false);
-    assert.equal(store.data, null);
-    assert.equal(store.snapshotId, null);
-    assert.deepEqual(store.records, []);
-    assert.equal(store.get('unit-fixture-sad-l04'), null);
+    // S7: the last valid snapshot and its indexes stay readable under an
+    // explicit stale flag; the snapshot id is retained for observation
+    // but cannot authorize a fresh write (GatewayClient refuses it).
+    assert.equal(store.stale, true);
+    assert.equal(store.ready, true);
+    assert.notEqual(store.data, null);
+    assert.equal(store.snapshotId, retainedSnapshot);
+    assert.ok(store.records.length > 0);
+    assert.notEqual(store.get('unit-fixture-sad-l04'), null);
+    assert.notEqual(store.error, '');
   });
 
   await test('ManifestStore exposes exact artifact revision guards', async () => {
@@ -725,10 +732,13 @@ function routerPlugin(settings = {}) {
     assert.notEqual(reloadStore.data, null);
     reloadValid = false;
     assert.equal(await reloadStore.load(), false);
-    assert.equal(reloadStore.ready, false);
-    assert.equal(reloadStore.data, null);
-    assert.equal(reloadStore.snapshotId, null);
-    assert.deepEqual(reloadStore.records, []);
+    // S7: a failed reload after a valid one retains that snapshot as
+    // explicitly stale instead of clearing it.
+    assert.equal(reloadStore.stale, true);
+    assert.equal(reloadStore.ready, true);
+    assert.notEqual(reloadStore.data, null);
+    assert.notEqual(reloadStore.snapshotId, null);
+    assert.ok(reloadStore.records.length > 0);
     assert.notEqual(reloadStore.error, '');
   });
 
@@ -912,21 +922,20 @@ function routerPlugin(settings = {}) {
     assert.equal(reloadSuccess, false, 'reload with wrong schema pin must fail');
     assert.match(reloadStore.error, /Unsupported manifest schema/);
 
-    // Verify previously populated state is completely cleared
-    assert.equal(reloadStore.ready, false, 'reloadStore.ready must be reset to false');
-    assert.equal(reloadStore.data, null, 'reloadStore.data must be reset to null');
-    assert.equal(reloadStore.records.length, 0, 'reloadStore.records must be reset to empty array');
-    assert.equal(reloadStore.byId.size, 0, 'reloadStore.byId must be reset to empty Map');
-    assert.equal(reloadStore.snapshotId, null, 'reloadStore.snapshotId must be reset to null');
-    assert.equal(reloadStore.contractVersion, null, 'reloadStore.contractVersion must be reset to null');
+    // S7: previously populated state is retained, explicitly stale —
+    // never cleared, and never presented as fresh. The wrong-pin
+    // manifest itself contributes nothing.
+    assert.equal(reloadStore.stale, true, 'reloadStore.stale must mark the retained snapshot');
+    assert.equal(reloadStore.ready, true, 'the retained snapshot stays readable');
+    assert.notEqual(reloadStore.data, null, 'reloadStore.data must retain the last valid manifest');
+    assert.ok(reloadStore.records.length > 0, 'reloadStore.records must retain the last valid rows');
+    assert.ok(reloadStore.byId.size > 0, 'reloadStore.byId must retain the last valid index');
+    assert.notEqual(reloadStore.snapshotId, null, 'the retained snapshot id stays observable');
+    assert.equal(reloadStore.contractVersion, CONTRACT, 'the retained contract version is the valid one');
 
-    // Verify derived read accessors expose no lingering data from prior load
-    assert.equal(reloadStore.get('unit-fixture-sad-l04'), null);
-    assert.deepEqual(reloadStore.units(), []);
-    assert.deepEqual(reloadStore.modules(), []);
-    assert.deepEqual(reloadStore.sources(), []);
-    assert.deepEqual(reloadStore.search('lecture'), []);
-    assert.equal(reloadStore.stage('stage-fixture-conditioning'), null);
+    // Derived read accessors still serve the retained valid snapshot.
+    assert.notEqual(reloadStore.get('unit-fixture-sad-l04'), null);
+    assert.ok(reloadStore.units().length > 0);
   });
 
   await test('Omnisearch full-text search uses only the public command', async () => {
@@ -2717,6 +2726,35 @@ function routerPlugin(settings = {}) {
     }
   });
 
+  await test('an obsolete persisted recovery shape blocks startup writes and is preserved', async () => {
+    // A record written by an older shape (schema_version 0, retired phase
+    // vocabulary) must never normalise to "nothing in flight": startup
+    // keeps it unresolved, refuses fresh writes, and leaves the durable
+    // bytes untouched for operator recovery.
+    const obsolete = {
+      schema_version: 0,
+      phase: 'done',
+      envelope: '{"legacy":true}',
+    };
+    let saves = 0;
+    const settings = { gatewayRecovery: obsolete, uiDrafts: emptyUiDrafts() };
+    const store = new SettingsGatewayRecoveryStore(settings, async () => { saves += 1; });
+    const state = await store.load();
+    assert.equal(state.kind, 'malformed');
+    assert.equal(store.unresolved, true);
+    assert.equal(store.replayable(), null, 'an obsolete record is never replayed');
+    let invoked = false;
+    const gateway = new GatewayClient({
+      runLos: () => { invoked = true; },
+      store: { snapshotId: SNAPSHOT },
+      recovery: store,
+    });
+    assert.throws(() => gateway.captureText('a fresh write'), /unresolved Gateway write/);
+    assert.equal(invoked, false);
+    assert.equal(settings.gatewayRecovery, obsolete, 'the obsolete record is not rewritten');
+    assert.equal(saves, 0, 'startup must not persist over the evidence');
+  });
+
   await test('only the draft the envelope carried is cleared', async () => {
     const envelope = (capability, payload) => ({
       schema_version: 2,
@@ -3210,6 +3248,17 @@ function routerPlugin(settings = {}) {
     assert.deepEqual(loaded.guard(), ['--expected-snapshot', SNAPSHOT]);
   });
 
+  await test('a stale snapshot never authorizes a fresh write', async () => {
+    let invoked = false;
+    const gateway = new GatewayClient({
+      runLos: () => { invoked = true; },
+      store: { snapshotId: SNAPSHOT, stale: true },
+    });
+    assert.throws(() => gateway.guard(), /stale snapshot/);
+    assert.throws(() => gateway.progress('unit-a', 'stage-a', 'complete'), /stale snapshot/);
+    assert.equal(invoked, false, 'the CLI must not be invoked at all');
+  });
+
   await test('a guarded write never reaches the CLI without a snapshot', async () => {
     let invoked = false;
     const gateway = new GatewayClient({
@@ -3249,6 +3298,131 @@ function routerPlugin(settings = {}) {
         return true;
       },
     );
+  });
+
+  async function ownedRecoveryRecord(id) {
+    const client = new GatewayClient({ store: { snapshotId: SNAPSHOT }, runLos() {} });
+    await client.prepareCapability('capture.create', { text: id, title: id }, SNAPSHOT, {});
+    return client.recovery.replayable().record;
+  }
+
+  await test('stale write admission also checks an explicit reviewed snapshot', async () => {
+    let invoked = false;
+    const gateway = new GatewayClient({
+      store: { snapshotId: SNAPSHOT, stale: true },
+      runLos() { invoked = true; },
+    });
+    assert.throws(() => gateway.capability('capture.create', { text: 'x' }, {
+      expectedSnapshot: SNAPSHOT,
+    }), /stale/);
+    await assert.rejects(gateway.prepareCapability('capture.create', { text: 'x' }, SNAPSHOT, {}), /stale/);
+    assert.equal(invoked, false);
+    assert.equal(gateway.recovery.replayable(), null);
+  });
+
+  await test('late confirmed refused and ambiguous responses cannot change a newer request', async () => {
+    for (const kind of ['confirmed', 'refused', 'ambiguous']) {
+      const settings = { gatewayRecovery: null, uiDrafts: emptyUiDrafts() };
+      const recovery = new SettingsGatewayRecoveryStore(settings, async () => {});
+      await recovery.load();
+      const a = await ownedRecoveryRecord('A');
+      await recovery.begin(a);
+      const gateway = new GatewayClient({ store: { snapshotId: SNAPSHOT }, recovery,
+        runLos(_args, callback, stdin) {
+          if (kind === 'confirmed') callback(null, gatewayConfirmation(stdin), '');
+          else if (kind === 'ambiguous') callback(new Error('lost response'), '', '');
+          else callback(Object.assign(new Error('refused'), { code: 2 }), gatewayConfirmation(stdin, SNAPSHOT, {
+            ok: false, transaction_id: null, receipt_path: null, snapshot_after: null,
+            error: { code: 'INVALID_REQUEST', message: 'A refused', retryable: false, details: {} },
+          }), '');
+        },
+      });
+      const response = await gateway.dispatchPreparedEnvelope(a.envelope_json);
+      assert.equal(response.outcome, kind);
+      await recovery.discardRefused();
+      const b = await ownedRecoveryRecord('B');
+      await recovery.begin(b);
+      const before = structuredClone(settings);
+      await assert.rejects(gateway.settle(response), /older response/);
+      assert.deepEqual(settings, before);
+      assert.equal(recovery.replayable().record.envelope_json, b.envelope_json);
+      assert.equal((await validateGatewayRecoveryRecord(settings.gatewayRecovery)).ok, true);
+    }
+  });
+
+  await test('a delayed response cannot resurrect a cleared recovery slot', async () => {
+    const settings = { gatewayRecovery: null, uiDrafts: emptyUiDrafts() };
+    const recovery = new SettingsGatewayRecoveryStore(settings, async () => {});
+    await recovery.load();
+    const a = await ownedRecoveryRecord('A'); await recovery.begin(a);
+    const gateway = new GatewayClient({ store: { snapshotId: SNAPSHOT }, recovery,
+      runLos(_args, callback, stdin) { callback(null, gatewayConfirmation(stdin), ''); },
+    });
+    const response = await gateway.dispatchPreparedEnvelope(a.envelope_json);
+    await recovery.discardRefused();
+    await assert.rejects(gateway.settle(response));
+    assert.equal(settings.gatewayRecovery, null);
+    assert.equal(recovery.unresolved, false);
+  });
+
+  await test('stale display state does not block exact prepared-envelope recovery', async () => {
+    const settings = { gatewayRecovery: null, uiDrafts: emptyUiDrafts() };
+    const recovery = new SettingsGatewayRecoveryStore(settings, async () => {});
+    await recovery.load();
+    const prepared = await ownedRecoveryRecord('replay'); await recovery.begin(prepared);
+    const sent = [];
+    const gateway = new GatewayClient({ store: { snapshotId: SNAPSHOT, stale: true }, recovery,
+      runLos(_args, callback, stdin) {
+        sent.push(stdin); callback(null, gatewayConfirmation(stdin, SNAPSHOT, { replayed: true }), '');
+      },
+    });
+    const result = await gateway.recoverPreparedEnvelope();
+    await gateway.settle(result);
+    assert.deepEqual(sent, [prepared.envelope_json]);
+    assert.equal(recovery.replayable().record.phase, 'confirmed');
+  });
+
+  await test('an old failed phase save cannot roll back a newer request', async () => {
+    const settings = { gatewayRecovery: null, uiDrafts: emptyUiDrafts() };
+    let defer = false, rejectOld;
+    const recovery = new SettingsGatewayRecoveryStore(settings, () => {
+      if (!defer) return Promise.resolve();
+      defer = false;
+      return new Promise((_resolve, reject) => { rejectOld = reject; });
+    });
+    await recovery.load(); await recovery.begin(await ownedRecoveryRecord('A'));
+    defer = true;
+    const old = recovery.markBlocked({ code: 'OLD', message: 'A' }).catch(error => error);
+    await recovery.discardRefused();
+    await recovery.begin(await ownedRecoveryRecord('B'));
+    const before = structuredClone(settings);
+    rejectOld(new Error('old save failed')); await old;
+    assert.deepEqual(settings, before);
+    assert.equal(recovery.replayable().envelope.payload.text, 'B');
+  });
+
+  await test('old settlement save failures cannot restore a retired request or its draft', async () => {
+    const settings = { gatewayRecovery: null, uiDrafts: emptyUiDrafts() };
+    let defer = false, rejectOld;
+    const recovery = new SettingsGatewayRecoveryStore(settings, () => {
+      if (!defer) return Promise.resolve();
+      defer = false;
+      return new Promise((_resolve, reject) => { rejectOld = reject; });
+    });
+    await recovery.load();
+    const a = await ownedRecoveryRecord('A'); await recovery.begin(a);
+    await recovery.markConfirmed(JSON.parse(gatewayConfirmation(a.envelope_json)));
+    const owner = recovery.replayable();
+    settings.uiDrafts.inbox = { text: 'A', title: 'A' };
+    defer = true;
+    const old = recovery.settleConfirmed(owner).catch(error => error);
+    await recovery.begin(await ownedRecoveryRecord('B'));
+    const before = structuredClone(settings);
+    rejectOld(new Error('old settlement failed')); await old;
+    assert.deepEqual(settings, before);
+    await assert.rejects(recovery.settleConfirmed(owner), /older result/);
+    await assert.rejects(recovery.settleConfirmed(), /Only a confirmed/);
+    assert.deepEqual(settings, before);
   });
 
   if (failures) {

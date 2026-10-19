@@ -29,6 +29,7 @@ import {
 } from './contracts/gateway-v2';
 import {
   MemoryGatewayRecoveryStore,
+  type GatewayRecoveryEntry,
   type GatewayRecoveryErrorV1,
   type GatewayRecoveryPort,
 } from './application/gateway-recovery';
@@ -60,6 +61,7 @@ interface GatewayHost {
   diagnostics?(event: DiagnosticEvent): void;
   store: {
     snapshotId: string | null;
+    stale?: boolean;
   };
   /**
    * Where an in-flight write is remembered. Optional so a test can exercise
@@ -102,10 +104,11 @@ export const GATEWAY_RECOVERY_BLOCKED =
  * (collapse into failure, learner retries) or lost a capture (collapse into
  * success, draft cleared).
  */
-export type GatewayDispatchOutcome =
+export type GatewayDispatchOutcome = (
   | { outcome: 'confirmed'; confirmation: GatewaySuccessV2 }
   | { outcome: 'refused'; failure: GatewayFailureV2 }
-  | { outcome: 'ambiguous'; error: GatewayRecoveryErrorV1 };
+  | { outcome: 'ambiguous'; error: GatewayRecoveryErrorV1 }
+) & { readonly recoveryOwner?: GatewayRecoveryEntry | null };
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -233,12 +236,28 @@ export class GatewayClient {
    */
   assertMutationAllowed(): void {
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     if (!this.recovery.unresolved) return;
     throw new GatewayError(
       'LearningOS has an unresolved Gateway write and will not start another until it is settled. Open Diagnostics → Gateway recovery.',
       null,
       { code: 'RECOVERY_REQUIRED', retryable: false },
     );
+  }
+
+  private assertFreshSnapshot(): void {
+    if (this.plugin.store.stale) {
+      throw new Error('LearningOS is showing a stale snapshot after a failed refresh; reload it before writing — nothing was written.');
+    }
+  }
+
+  private assertRecoveryOwner(owner: GatewayRecoveryEntry | null | undefined): void {
+    if (owner !== undefined && this.recovery.replayable() !== owner) {
+      throw new GatewayError(
+        'The Gateway recovery request or phase changed; the older response was ignored.',
+        null, { code: 'RECOVERY_REQUIRED', retryable: false },
+      );
+    }
   }
 
   /**
@@ -358,6 +377,7 @@ export class GatewayClient {
         { code: 'UNCONFIRMED', retryable: false },
       );
     }
+    this.assertFreshSnapshot();
     const expectedSnapshot = options.expectedSnapshot || this.snapshotId();
     if (!isSha256(expectedSnapshot)) {
       throw new GatewayError(
@@ -423,6 +443,7 @@ export class GatewayClient {
     identity?: GatewayIdentity,
   ): Promise<string> {
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     const requestId = identity?.requestId ?? nextRequestId(name);
     const idempotencyKey = identity?.idempotencyKey ?? nextIdempotencyKey(requestId);
     // Order matters, and it is the whole defect this method once had. A
@@ -458,6 +479,7 @@ export class GatewayClient {
     };
     const envelopeJson = JSON.stringify(envelope);
     this.assertLifecycleActive();
+    this.assertFreshSnapshot();
     await this.recovery.begin({
       schema_version: 1,
       phase: 'prepared',
@@ -501,6 +523,11 @@ export class GatewayClient {
     { replayOnly = false, trace }: { replayOnly?: boolean; trace?: TraceContext } = {},
   ): Promise<GatewayDispatchOutcome> {
     this.assertLifecycleActive();
+    const owner = this.recovery.replayable();
+    if (owner && owner.record.envelope_json !== envelopeJson) {
+      throw new GatewayError('The prepared envelope does not own the current recovery request.',
+        null, { code: 'RECOVERY_REQUIRED', retryable: false });
+    }
     // One physical dispatch, one attempt span. The operation stays stable
     // across a send and its in-session replay (same trace id, fresh span
     // id); a caller without an operation — e.g. recovery after a restart —
@@ -518,7 +545,7 @@ export class GatewayClient {
         code,
         replayed: result.outcome === 'confirmed' ? result.confirmation.replayed : false,
       }, attemptCtx.spanId));
-      return result;
+      return { ...result, recoveryOwner: owner };
     };
     let envelope: { capability?: unknown; request_id?: unknown; idempotency_key?: unknown };
     try {
@@ -621,10 +648,11 @@ export class GatewayClient {
     if (!entry) {
       return {
         outcome: 'ambiguous',
+        recoveryOwner: null,
         error: { code: 'RECOVERY_REQUIRED', message: 'There is no replayable Gateway request.' },
       };
     }
-    await this.recovery.markRecovering(entry.record.last_error);
+    await this.recovery.markRecovering(entry.record.last_error, entry);
     const result = await this.dispatchPreparedEnvelope(
       entry.record.envelope_json, trace === undefined ? {} : { trace });
     if (result.outcome !== 'refused') return result;
@@ -638,6 +666,7 @@ export class GatewayClient {
      */
     return {
       outcome: 'ambiguous',
+      recoveryOwner: result.recoveryOwner ?? null,
       error: {
         code: result.failure.error.code,
         message: `The recovery attempt was refused (${result.failure.error.code}): ${result.failure.error.message}`,
@@ -659,6 +688,7 @@ export class GatewayClient {
     if (!entry || entry.record.confirmation === null) {
       return {
         outcome: 'ambiguous',
+        recoveryOwner: entry,
         error: {
           code: 'RECOVERY_REQUIRED',
           message: 'There is no persisted confirmation for Core to verify.',
@@ -675,6 +705,7 @@ export class GatewayClient {
     if (result.outcome === 'confirmed') {
       return {
         outcome: 'ambiguous',
+        recoveryOwner: result.recoveryOwner ?? null,
         error: {
           code: 'UNVERIFIED_CONFIRMATION',
           message: 'Core returned a non-replay response to a receipt-only lookup.',
@@ -684,6 +715,7 @@ export class GatewayClient {
     if (result.outcome === 'refused') {
       return {
         outcome: 'ambiguous',
+        recoveryOwner: result.recoveryOwner ?? null,
         error: {
           code: result.failure.error.code,
           message: `Core could not verify the persisted receipt (${result.failure.error.code}): ${result.failure.error.message}`,
@@ -717,7 +749,8 @@ export class GatewayClient {
     let result = await this.dispatchPreparedEnvelope(envelopeJson, { trace: operation });
     if (result.outcome === 'ambiguous') {
       this.announce(GATEWAY_RECOVERY_NOTICE);
-      await this.recovery.markRecovering(result.error);
+      this.assertRecoveryOwner(result.recoveryOwner);
+      await this.recovery.markRecovering(result.error, result.recoveryOwner ?? undefined);
       result = await this.recoverPreparedEnvelope(operation);
     }
     return this.settle(result, operation);
@@ -750,6 +783,15 @@ export class GatewayClient {
   /** Turn one settled outcome into the record state and the caller's answer. */
   async settle(result: GatewayDispatchOutcome, trace?: TraceContext): Promise<GatewaySuccessV2> {
     this.assertLifecycleActive();
+    this.assertRecoveryOwner(result.recoveryOwner);
+    const owner = result.recoveryOwner ?? this.recovery.replayable() ?? undefined;
+    if (owner && result.outcome === 'refused'
+        && (result.failure.request_id !== owner.envelope.request_id
+          || result.failure.idempotency_key !== owner.envelope.idempotency_key
+          || result.failure.capability !== owner.envelope.capability)) {
+      throw new GatewayError('The refusal does not belong to the current Gateway request.',
+        null, { code: 'RECOVERY_REQUIRED', retryable: false });
+    }
     // Without an operation there is no stream to join: restart-path callers
     // settle here with none, and their settlement linkage is Phase 3 work.
     const terminal = (name: string, outcome: string, code: string | null): void => {
@@ -766,14 +808,14 @@ export class GatewayClient {
       // Not cleared here, and no event either: a receipt is not yet an
       // observation. The record is retired only after the projection has
       // been reconciled with it, and the settled event is emitted there.
-      await this.recovery.markConfirmed(result.confirmation);
+      await this.recovery.markConfirmed(result.confirmation, owner);
       this.pendingObservation = trace === undefined
         ? null
         : { trace, requestId: result.confirmation.request_id };
       return result.confirmation;
     }
     if (result.outcome === 'refused') {
-      await this.recovery.discardRefused();
+      await this.recovery.discardRefused(owner);
       // A definitive refusal is actually settled: nothing was written and
       // nothing stays pending, so no observation is owed.
       terminal('recovery.settled', 'refused', result.failure.error.code);
@@ -786,7 +828,7 @@ export class GatewayClient {
         },
       );
     }
-    await this.recovery.markBlocked(result.error);
+    await this.recovery.markBlocked(result.error, owner);
     // Blocked is the opposite of settled: the record stays and waits for the
     // learner, so it joins the stream under its own name.
     terminal('recovery.blocked', 'blocked', result.error.code);
@@ -806,6 +848,7 @@ export class GatewayClient {
    * a misleading message, or worse, matched by accident.
    */
   snapshotId(): string {
+    this.assertFreshSnapshot();
     const snapshotId = this.plugin.store.snapshotId;
     if (!snapshotId) {
       throw new Error('LearningOS has no loaded snapshot to guard this change against; nothing was written.');

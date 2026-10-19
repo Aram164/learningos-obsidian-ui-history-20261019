@@ -1,3 +1,4 @@
+import { manifestFreshness } from '../components';
 import { withRenderFocus } from '../accessibility/render-focus';
 import { renderFiles, renderDecisions } from '../features/project/files';
 import { renderBoundaryBanner, renderStructure } from '../features/project/structure';
@@ -56,6 +57,7 @@ class ProjectLinkReasonModal extends Modal {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-linked-reason-modal',
@@ -245,6 +247,7 @@ export class ProjectView extends ItemView {
     const root = this.contentEl;
 
     root.empty();
+    manifestFreshness(root, this.plugin.store);
     root.addClass(
       'los-root',
       'los-project-view',
